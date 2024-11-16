@@ -4,13 +4,13 @@ use std::{
 };
 
 use conduit::{
-	err, is_not_empty,
+	debug_warn, is_not_empty,
 	result::LogErr,
 	utils::{stream::TryIgnore, ReadyExt, StreamTools},
 	warn, Result,
 };
 use database::{serialize_to_vec, Deserialized, Ignore, Interfix, Json, Map};
-use futures::{future::join4, stream::iter, Stream, StreamExt};
+use futures::{future::join5, stream::iter, Stream, StreamExt};
 use itertools::Itertools;
 use ruma::{
 	events::{
@@ -50,11 +50,13 @@ struct Data {
 	roomuserid_invitecount: Arc<Map>,
 	roomuserid_joined: Arc<Map>,
 	roomuserid_leftcount: Arc<Map>,
+	roomuserid_knockedcount: Arc<Map>,
 	roomuseroncejoinedids: Arc<Map>,
 	serverroomids: Arc<Map>,
 	userroomid_invitestate: Arc<Map>,
 	userroomid_joined: Arc<Map>,
 	userroomid_leftstate: Arc<Map>,
+	userroomid_knockedstate: Arc<Map>,
 }
 
 type AppServiceInRoomCache = RwLock<HashMap<OwnedRoomId, HashMap<String, bool>>>;
@@ -79,11 +81,13 @@ impl crate::Service for Service {
 				roomuserid_invitecount: args.db["roomuserid_invitecount"].clone(),
 				roomuserid_joined: args.db["roomuserid_joined"].clone(),
 				roomuserid_leftcount: args.db["roomuserid_leftcount"].clone(),
+				roomuserid_knockedcount: args.db["roomuserid_knockedcount"].clone(),
 				roomuseroncejoinedids: args.db["roomuseroncejoinedids"].clone(),
 				serverroomids: args.db["serverroomids"].clone(),
 				userroomid_invitestate: args.db["userroomid_invitestate"].clone(),
 				userroomid_joined: args.db["userroomid_joined"].clone(),
 				userroomid_leftstate: args.db["userroomid_leftstate"].clone(),
+				userroomid_knockedstate: args.db["userroomid_knockedstate"].clone(),
 			},
 		}))
 	}
@@ -235,7 +239,12 @@ impl Service {
 			MembershipState::Leave | MembershipState::Ban => {
 				self.mark_as_left(user_id, room_id);
 			},
-			_ => {},
+			MembershipState::Knock => {
+				self.mark_as_knocked(user_id, room_id, last_state);
+			},
+			_ => {
+				debug_warn!("unknown membership state received: {membership:?}");
+			},
 		}
 
 		if update_joined_count {
@@ -303,6 +312,9 @@ impl Service {
 		self.db.userroomid_leftstate.remove(&userroom_id);
 		self.db.roomuserid_leftcount.remove(&roomuser_id);
 
+		self.db.userroomid_knockedstate.remove(&userroom_id);
+		self.db.roomuserid_knockedcount.remove(&roomuser_id);
+
 		self.db.roomid_inviteviaservers.remove(room_id);
 	}
 
@@ -331,6 +343,41 @@ impl Service {
 
 		self.db.userroomid_invitestate.remove(&userroom_id);
 		self.db.roomuserid_invitecount.remove(&roomuser_id);
+
+		self.db.userroomid_knockedstate.remove(&userroom_id);
+		self.db.roomuserid_knockedcount.remove(&roomuser_id);
+
+		self.db.roomid_inviteviaservers.remove(room_id);
+	}
+
+	/// Direct DB function to directly mark a user as knocked. It is not
+	/// recommended to use this directly. You most likely should use
+	/// `update_membership` instead
+	#[tracing::instrument(skip(self), level = "debug")]
+	pub fn mark_as_knocked(
+		&self, user_id: &UserId, room_id: &RoomId, knocked_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
+	) {
+		let userroom_id = (user_id, room_id);
+		let userroom_id = serialize_to_vec(userroom_id).expect("failed to serialize userroom_id");
+
+		let roomuser_id = (room_id, user_id);
+		let roomuser_id = serialize_to_vec(roomuser_id).expect("failed to serialize roomuser_id");
+
+		self.db
+			.userroomid_knockedstate
+			.raw_put(&userroom_id, Json(knocked_state.unwrap_or_default()));
+		self.db
+			.roomuserid_knockedcount
+			.raw_aput::<8, _, _>(&roomuser_id, self.services.globals.next_count().unwrap());
+
+		self.db.userroomid_joined.remove(&userroom_id);
+		self.db.roomuserid_joined.remove(&roomuser_id);
+
+		self.db.userroomid_invitestate.remove(&userroom_id);
+		self.db.roomuserid_invitecount.remove(&roomuser_id);
+
+		self.db.userroomid_leftstate.remove(&userroom_id);
+		self.db.roomuserid_leftcount.remove(&roomuser_id);
 
 		self.db.roomid_inviteviaservers.remove(room_id);
 	}
@@ -473,6 +520,16 @@ impl Service {
 	}
 
 	#[tracing::instrument(skip(self), level = "debug")]
+	pub async fn get_knock_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
+		let key = (room_id, user_id);
+		self.db
+			.roomuserid_knockedcount
+			.qry(&key)
+			.await
+			.deserialized()
+	}
+
+	#[tracing::instrument(skip(self), level = "debug")]
 	pub async fn get_left_count(&self, room_id: &RoomId, user_id: &UserId) -> Result<u64> {
 		let key = (room_id, user_id);
 		self.db.roomuserid_leftcount.qry(&key).await.deserialized()
@@ -504,11 +561,38 @@ impl Service {
 			.ignore_err()
 	}
 
+	/// Returns an iterator over all rooms a user is currently knocking.
+	#[tracing::instrument(skip(self), level = "debug")]
+	pub fn rooms_knocked<'a>(&'a self, user_id: &'a UserId) -> impl Stream<Item = StrippedStateEventItem> + Send + 'a {
+		type KeyVal<'a> = (Key<'a>, Raw<Vec<AnyStrippedStateEvent>>);
+		type Key<'a> = (&'a UserId, &'a RoomId);
+
+		let prefix = (user_id, Interfix);
+		self.db
+			.userroomid_knockedstate
+			.stream_prefix(&prefix)
+			.ignore_err()
+			.map(|((_, room_id), state): KeyVal<'_>| (room_id.to_owned(), state))
+			.map(|(room_id, state)| Ok((room_id, state.deserialize_as()?)))
+			.ignore_err()
+	}
+
 	#[tracing::instrument(skip(self), level = "debug")]
 	pub async fn invite_state(&self, user_id: &UserId, room_id: &RoomId) -> Result<Vec<Raw<AnyStrippedStateEvent>>> {
 		let key = (user_id, room_id);
 		self.db
 			.userroomid_invitestate
+			.qry(&key)
+			.await
+			.deserialized()
+			.and_then(|val: Raw<Vec<AnyStrippedStateEvent>>| val.deserialize_as().map_err(Into::into))
+	}
+
+	#[tracing::instrument(skip(self), level = "debug")]
+	pub async fn knock_state(&self, user_id: &UserId, room_id: &RoomId) -> Result<Vec<Raw<AnyStrippedStateEvent>>> {
+		let key = (user_id, room_id);
+		self.db
+			.userroomid_knockedstate
 			.qry(&key)
 			.await
 			.deserialized()
@@ -555,6 +639,12 @@ impl Service {
 	}
 
 	#[tracing::instrument(skip(self), level = "debug")]
+	pub async fn is_knocked<'a>(&'a self, user_id: &'a UserId, room_id: &'a RoomId) -> bool {
+		let key = (user_id, room_id);
+		self.db.userroomid_knockedstate.qry(&key).await.is_ok()
+	}
+
+	#[tracing::instrument(skip(self), level = "debug")]
 	pub async fn is_invited(&self, user_id: &UserId, room_id: &RoomId) -> bool {
 		let key = (user_id, room_id);
 		self.db.userroomid_invitestate.qry(&key).await.is_ok()
@@ -567,9 +657,10 @@ impl Service {
 	}
 
 	pub async fn user_membership(&self, user_id: &UserId, room_id: &RoomId) -> Option<MembershipState> {
-		let states = join4(
+		let states = join5(
 			self.is_joined(user_id, room_id),
 			self.is_left(user_id, room_id),
+			self.is_knocked(user_id, room_id),
 			self.is_invited(user_id, room_id),
 			self.once_joined(user_id, room_id),
 		)
@@ -578,8 +669,9 @@ impl Service {
 		match states {
 			(true, ..) => Some(MembershipState::Join),
 			(_, true, ..) => Some(MembershipState::Leave),
-			(_, _, true, ..) => Some(MembershipState::Invite),
-			(false, false, false, true) => Some(MembershipState::Ban),
+			(_, _, true, ..) => Some(MembershipState::Knock),
+			(_, _, _, true, ..) => Some(MembershipState::Invite),
+			(false, false, false, false, true) => Some(MembershipState::Ban),
 			_ => None,
 		}
 	}
@@ -595,10 +687,10 @@ impl Service {
 			.map(|(_, servers): KeyVal<'_>| *servers.last().expect("at least one server"))
 	}
 
-	/// Gets up to three servers that are likely to be in the room in the
+	/// Gets up to five servers that are likely to be in the room in the
 	/// distant future.
 	///
-	/// See <https://spec.matrix.org/v1.10/appendices/#routing>
+	/// See <https://spec.matrix.org/latest/appendices/#routing>
 	#[tracing::instrument(skip(self))]
 	pub async fn servers_route_via(&self, room_id: &RoomId) -> Result<Vec<OwnedServerName>> {
 		let most_powerful_user_server = self
@@ -613,23 +705,23 @@ impl Service {
 					.max_by_key(|(_, power)| *power)
 					.and_then(|x| (x.1 >= &int!(50)).then_some(x))
 					.map(|(user, _power)| user.server_name().to_owned())
-			})
-			.map_err(|e| err!(Database(error!(?e, "Invalid power levels event content in database."))))?;
+			});
 
 		let mut servers: Vec<OwnedServerName> = self
 			.room_members(room_id)
 			.counts_by(|user| user.server_name().to_owned())
 			.await
 			.into_iter()
+			.filter(|(server, _)| !server.is_ip_literal())
 			.sorted_by_key(|(_, users)| *users)
 			.map(|(server, _)| server)
 			.rev()
-			.take(3)
+			.take(5)
 			.collect();
 
-		if let Some(server) = most_powerful_user_server {
+		if let Ok(Some(server)) = most_powerful_user_server {
 			servers.insert(0, server);
-			servers.truncate(3);
+			servers.truncate(5);
 		}
 
 		Ok(servers)
@@ -729,6 +821,9 @@ impl Service {
 
 		self.db.userroomid_leftstate.remove(&userroom_id);
 		self.db.roomuserid_leftcount.remove(&roomuser_id);
+
+		self.db.userroomid_knockedstate.remove(&userroom_id);
+		self.db.roomuserid_knockedcount.remove(&roomuser_id);
 
 		if let Some(servers) = invite_via.filter(is_not_empty!()) {
 			self.add_servers_invite_via(room_id, servers).await;

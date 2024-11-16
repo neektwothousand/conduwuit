@@ -18,8 +18,8 @@ use ruma::{
 		sync::sync_events::{
 			self,
 			v3::{
-				Ephemeral, Filter, GlobalAccountData, InviteState, InvitedRoom, JoinedRoom, LeftRoom, Presence,
-				RoomAccountData, RoomSummary, Rooms, State as RoomState, Timeline, ToDevice,
+				Ephemeral, Filter, GlobalAccountData, InviteState, InvitedRoom, JoinedRoom, KnockedRoom, LeftRoom,
+				Presence, RoomAccountData, RoomSummary, Rooms, State as RoomState, Timeline, ToDevice,
 			},
 			DeviceLists, UnreadNotificationsCount,
 		},
@@ -241,6 +241,41 @@ pub(crate) async fn sync_events_route(
 		);
 	}
 
+	let mut knocked_rooms = BTreeMap::new();
+	let all_knocked_rooms: Vec<_> = services
+		.rooms
+		.state_cache
+		.rooms_knocked(&sender_user)
+		.collect()
+		.await;
+
+	for (room_id, knock_state_events) in all_knocked_rooms {
+		// Get and drop the lock to wait for remaining operations to finish
+		let insert_lock = services.rooms.timeline.mutex_insert.lock(&room_id).await;
+		drop(insert_lock);
+
+		let knock_count = services
+			.rooms
+			.state_cache
+			.get_knock_count(&room_id, &sender_user)
+			.await
+			.ok();
+
+		// Knocked before last sync
+		if Some(since) >= knock_count {
+			continue;
+		}
+
+		knocked_rooms.insert(
+			room_id.clone(),
+			KnockedRoom {
+				knock_state: sync_events::v3::KnockState {
+					events: knock_state_events,
+				},
+			},
+		);
+	}
+
 	for user_id in left_encrypted_users {
 		let dont_share_encrypted_room = !share_encrypted_room(&services, &sender_user, &user_id, None).await;
 
@@ -263,7 +298,7 @@ pub(crate) async fn sync_events_route(
 			leave: left_rooms,
 			join: joined_rooms,
 			invite: invited_rooms,
-			knock: BTreeMap::new(), // TODO
+			knock: knocked_rooms,
 		},
 		presence: Presence {
 			events: presence_updates

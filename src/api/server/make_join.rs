@@ -1,7 +1,7 @@
 use axum::extract::State;
 use conduit::{
 	utils::{IterStream, ReadyExt},
-	warn,
+	warn, Err,
 };
 use futures::StreamExt;
 use ruma::{
@@ -59,10 +59,7 @@ pub(crate) async fn create_join_event_template_route(
 			&body.user_id,
 			&body.room_id,
 		);
-		return Err(Error::BadRequest(
-			ErrorKind::forbidden(),
-			"Server is banned on this homeserver.",
-		));
+		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
 
 	if let Some(server) = body.room_id.server_name() {
@@ -72,10 +69,7 @@ pub(crate) async fn create_join_event_template_route(
 			.forbidden_remote_server_names
 			.contains(&server.to_owned())
 		{
-			return Err(Error::BadRequest(
-				ErrorKind::forbidden(),
-				"Server is banned on this homeserver.",
-			));
+			return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 		}
 	}
 

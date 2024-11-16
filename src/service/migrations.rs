@@ -1,4 +1,4 @@
-use std::cmp;
+use std::{cmp, collections::HashSet};
 
 use conduit::{
 	debug, debug_info, debug_warn, error, info,
@@ -14,7 +14,7 @@ use itertools::Itertools;
 use ruma::{
 	events::{push_rules::PushRulesEvent, room::member::MembershipState, GlobalAccountDataEventType},
 	push::Ruleset,
-	OwnedUserId, UserId,
+	UserId,
 };
 
 use crate::{media, Services};
@@ -69,6 +69,7 @@ async fn fresh(services: &Services) -> Result<()> {
 	db["global"].insert(b"fix_bad_double_separator_in_state_cache", []);
 	db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
 	db["global"].insert(b"fix_referencedevents_missing_sep", []);
+	db["global"].insert(b"update_knocked_user_memberships_locally", []);
 
 	// Create the admin room and server user on first run
 	crate::admin::create_admin_room(services).boxed().await?;
@@ -128,6 +129,14 @@ async fn migrate(services: &Services) -> Result<()> {
 		.is_not_found()
 	{
 		fix_referencedevents_missing_sep(services).await?;
+	}
+
+	if db["global"]
+		.get(b"update_knocked_user_memberships_locally")
+		.await
+		.is_not_found()
+	{
+		update_knocked_user_memberships_locally(services).await?;
 	}
 
 	let version_match = services.globals.db.database_version().await == DATABASE_VERSION
@@ -371,24 +380,24 @@ async fn fix_bad_double_separator_in_state_cache(services: &Services) -> Result<
 	Ok(())
 }
 
-async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) -> Result<()> {
+async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) -> Result {
 	warn!("Retroactively fixing bad data from broken roomuserid_joined");
 
 	let db = &services.db;
-	let _cork = db.cork_and_sync();
+	let cork = db.cork_and_sync();
 
 	let room_ids = services
 		.rooms
 		.metadata
 		.iter_ids()
 		.map(ToOwned::to_owned)
-		.collect::<Vec<_>>()
+		.collect::<HashSet<_>>()
 		.await;
 
 	for room_id in &room_ids {
 		debug_info!("Fixing room {room_id}");
 
-		let users_in_room: Vec<OwnedUserId> = services
+		let users_in_room: HashSet<_> = services
 			.rooms
 			.state_cache
 			.room_members(room_id)
@@ -406,7 +415,7 @@ async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) 
 					.get_member(room_id, user_id)
 					.map(|member| member.map_or(false, |member| member.membership == MembershipState::Join))
 			})
-			.collect::<Vec<_>>()
+			.collect::<HashSet<_>>()
 			.await;
 
 		let non_joined_members = users_in_room
@@ -419,7 +428,7 @@ async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) 
 					.get_member(room_id, user_id)
 					.map(|member| member.map_or(false, |member| member.membership == MembershipState::Join))
 			})
-			.collect::<Vec<_>>()
+			.collect::<HashSet<_>>()
 			.await;
 
 		for user_id in &joined_members {
@@ -445,11 +454,11 @@ async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) 
 			.await;
 	}
 
-	db.db.cleanup()?;
-	db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
-
+	drop(cork);
 	info!("Finished fixing");
-	Ok(())
+
+	db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
+	db.db.cleanup()
 }
 
 async fn fix_referencedevents_missing_sep(services: &Services) -> Result {
@@ -491,5 +500,57 @@ async fn fix_referencedevents_missing_sep(services: &Services) -> Result {
 	info!(?total, ?fixed, "Fixed missing record separators in 'referencedevents'.");
 
 	db["global"].insert(b"fix_referencedevents_missing_sep", []);
+	db.db.cleanup()
+}
+
+async fn update_knocked_user_memberships_locally(services: &Services) -> Result {
+	info!("Updating database of knocked users locally");
+
+	let db = &services.db;
+	let cork = db.cork_and_sync();
+
+	let room_ids = services
+		.rooms
+		.metadata
+		.iter_ids()
+		.collect::<HashSet<_>>()
+		.await;
+
+	for room_id in room_ids {
+		debug_info!("Updating {room_id}");
+
+		let users_in_room: HashSet<_> = services
+			.rooms
+			.state_cache
+			.room_members(room_id)
+			.collect()
+			.await;
+
+		let knocked_members = users_in_room
+			.iter()
+			.stream()
+			.filter(|user_id| {
+				services
+					.rooms
+					.state_accessor
+					.get_member(room_id, user_id)
+					.map(|member| member.map_or(false, |member| member.membership == MembershipState::Knock))
+			})
+			.collect::<HashSet<_>>()
+			.await;
+
+		for user_id in knocked_members {
+			debug_info!("Making {user_id} as knocked");
+			services
+				.rooms
+				.state_cache
+				.mark_as_knocked(user_id, room_id, None);
+		}
+	}
+
+	drop(cork);
+	info!("Finished updating knocked user memberships locally in database");
+
+	db["global"].insert(b"update_knocked_user_memberships_locally", []);
 	db.db.cleanup()
 }

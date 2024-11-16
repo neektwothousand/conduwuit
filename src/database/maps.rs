@@ -56,6 +56,7 @@ pub const MAPS: &[&str] = &[
 	"roomuserid_joined",
 	"roomuserid_lastprivatereadupdate",
 	"roomuserid_leftcount",
+	"roomuserid_knockedcount",
 	"roomuserid_privateread",
 	"roomuseroncejoinedids",
 	"roomusertype_roomuserdataid",
@@ -100,5 +101,6 @@ pub const MAPS: &[&str] = &[
 	"userroomid_invitestate",
 	"userroomid_joined",
 	"userroomid_leftstate",
+	"userroomid_knockedstate",
 	"userroomid_notificationcount",
 ];

@@ -3,7 +3,7 @@
 use std::borrow::Borrow;
 
 use axum::extract::State;
-use conduit::{err, pdu::gen_event_id_canonical_json, utils::IterStream, warn, Error, Result};
+use conduit::{err, pdu::gen_event_id_canonical_json, utils::IterStream, warn, Err, Error, Result};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use ruma::{
 	api::{client::error::ErrorKind, federation::membership::create_join_event},
@@ -126,18 +126,19 @@ async fn create_join_event(
 		));
 	};
 
-	if content
+	let should_sign_join_event = content
 		.join_authorized_via_users_server
 		.is_some_and(|user| services.globals.user_is_local(&user))
 		&& super::user_can_perform_restricted_join(services, &sender, room_id, &room_version_id)
 			.await
-			.unwrap_or_default()
-	{
+			.unwrap_or_default();
+
+	if should_sign_join_event {
 		services
 			.server_keys
 			.hash_and_sign_event(&mut value, &room_version_id)
 			.map_err(|e| err!(Request(InvalidParam("Failed to sign event: {e}"))))?;
-	}
+	};
 
 	let origin: OwnedServerName = serde_json::from_value(
 		serde_json::to_value(
@@ -206,8 +207,12 @@ async fn create_join_event(
 	Ok(create_join_event::v1::RoomState {
 		auth_chain,
 		state,
-		// Event field is required if the room version supports restricted join rules.
-		event: to_raw_value(&CanonicalJsonValue::Object(value)).ok(),
+		// Event field is required if the room is using restricted join rules and we sign the event
+		event: if should_sign_join_event {
+			to_raw_value(&CanonicalJsonValue::Object(value)).ok()
+		} else {
+			None
+		},
 	})
 }
 
@@ -228,10 +233,7 @@ pub(crate) async fn create_join_event_v1_route(
 			body.origin(),
 			&body.room_id,
 		);
-		return Err(Error::BadRequest(
-			ErrorKind::forbidden(),
-			"Server is banned on this homeserver.",
-		));
+		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
 
 	if let Some(server) = body.room_id.server_name() {
@@ -246,10 +248,7 @@ pub(crate) async fn create_join_event_v1_route(
 				body.origin(),
 				&body.room_id,
 			);
-			return Err(Error::BadRequest(
-				ErrorKind::forbidden(),
-				"Server is banned on this homeserver.",
-			));
+			return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 		}
 	}
 
@@ -274,10 +273,7 @@ pub(crate) async fn create_join_event_v2_route(
 		.forbidden_remote_server_names
 		.contains(body.origin())
 	{
-		return Err(Error::BadRequest(
-			ErrorKind::forbidden(),
-			"Server is banned on this homeserver.",
-		));
+		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
 
 	if let Some(server) = body.room_id.server_name() {
@@ -287,10 +283,7 @@ pub(crate) async fn create_join_event_v2_route(
 			.forbidden_remote_server_names
 			.contains(&server.to_owned())
 		{
-			return Err(Error::BadRequest(
-				ErrorKind::forbidden(),
-				"Server is banned on this homeserver.",
-			));
+			return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 		}
 	}
 

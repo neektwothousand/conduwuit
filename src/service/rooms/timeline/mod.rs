@@ -511,13 +511,16 @@ impl Service {
 						UserId::parse(state_key.clone()).expect("This state_key was previously validated");
 
 					let content: RoomMemberEventContent = pdu.get_content()?;
-					let invite_state = match content.membership {
-						MembershipState::Invite => self.services.state.summary_stripped(pdu).await.into(),
+					let stripped_state = match content.membership {
+						MembershipState::Invite | MembershipState::Knock => {
+							self.services.state.summary_stripped(pdu).await.into()
+						},
 						_ => None,
 					};
 
-					// Update our membership info, we do this here incase a user is invited
-					// and immediately leaves we need the DB to record the invite event for auth
+					// Update our membership info, we do this here incase a user is invited or
+					// knocked and immediately leaves we need the DB to record the invite or
+					// knock event for auth
 					self.services
 						.state_cache
 						.update_membership(
@@ -525,7 +528,7 @@ impl Service {
 							&target_user_id,
 							content,
 							&pdu.sender,
-							invite_state,
+							stripped_state,
 							None,
 							true,
 						)

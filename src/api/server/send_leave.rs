@@ -1,7 +1,7 @@
 #![allow(deprecated)]
 
 use axum::extract::State;
-use conduit::{err, utils::ReadyExt, Error, Result};
+use conduit::{err, Err, Error, Result};
 use ruma::{
 	api::{client::error::ErrorKind, federation::membership::create_leave_event},
 	events::{
@@ -74,10 +74,9 @@ async fn create_leave_event(
 	.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Event content is empty or invalid"))?;
 
 	if content.membership != MembershipState::Leave {
-		return Err(Error::BadRequest(
-			ErrorKind::InvalidParam,
-			"Not allowed to send a non-leave membership event to leave endpoint.",
-		));
+		return Err!(Request(InvalidParam(
+			"Not allowed to send a non-leave membership event to leave endpoint."
+		)));
 	}
 
 	let event_type: StateEventType = serde_json::from_value(
@@ -90,10 +89,9 @@ async fn create_leave_event(
 	.map_err(|_| Error::BadRequest(ErrorKind::BadJson, "Event does not have a valid state event type."))?;
 
 	if event_type != StateEventType::RoomMember {
-		return Err(Error::BadRequest(
-			ErrorKind::InvalidParam,
+		return Err!(Request(InvalidParam(
 			"Not allowed to send non-membership state event to leave endpoint.",
-		));
+		)));
 	}
 
 	// ACL check sender server name
@@ -151,11 +149,5 @@ async fn create_leave_event(
 
 	drop(mutex_lock);
 
-	let servers = services
-		.rooms
-		.state_cache
-		.room_servers(room_id)
-		.ready_filter(|server| !services.globals.server_is_ours(server));
-
-	services.sending.send_pdu_servers(servers, &pdu_id).await
+	services.sending.send_pdu_room(room_id, &pdu_id).await
 }

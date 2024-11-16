@@ -117,12 +117,12 @@ pub(crate) async fn create_invite_route(
 	let mut invite_state = body.invite_room_state.clone();
 
 	let mut event: JsonObject = serde_json::from_str(body.event.get())
-		.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Invalid invite event bytes."))?;
+		.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Invalid invite event PDU."))?;
 
 	event.insert("event_id".to_owned(), "$placeholder".into());
 
 	let pdu: PduEvent = serde_json::from_value(event.into())
-		.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Invalid invite event."))?;
+		.map_err(|_| Error::BadRequest(ErrorKind::InvalidParam, "Invalid invite event PDU."))?;
 
 	invite_state.push(pdu.to_stripped_state_event());
 

@@ -1,5 +1,5 @@
 use axum::extract::State;
-use conduit::Err;
+use conduit::{debug_warn, Err};
 use ruma::{
 	api::{client::error::ErrorKind, federation::knock::create_knock_event_template},
 	events::room::member::{MembershipState, RoomMemberEventContent},
@@ -80,6 +80,22 @@ pub(crate) async fn create_knock_event_template_route(
 			},
 			"Your homeserver does not support the features required to knock on this room.",
 		));
+	}
+
+	if let Ok(membership) = services
+		.rooms
+		.state_accessor
+		.get_member(&body.room_id, &body.user_id)
+		.await
+	{
+		if membership.membership == MembershipState::Ban {
+			debug_warn!(
+				"Remote user {} is banned from {} but attempted to knock",
+				&body.user_id,
+				&body.room_id
+			);
+			return Err!(Request(Forbidden("You cannot knock on a room you are banned from.")));
+		}
 	}
 
 	let state_lock = services.rooms.state.mutex.lock(&body.room_id).await;
